@@ -3,30 +3,25 @@
 #
 # Two kinds of memory wired together:
 #   1. Conversation history  — LangGraph checkpointer (PostgresSaver)
-#      Stores the raw message thread per session. Automatic, no extra code.
-#
 #   2. Semantic / long-term memory  — PGVector
-#      Stores + retrieves facts by similarity. You control what goes in.
-#      Injected into the system prompt before each LLM call.
 #
 # Setup:
-#   pip install langgraph langchain-anthropic langchain-postgres \
+#   pip install langgraph langchain-openai langchain-postgres \
 #               langchain-community psycopg2-binary
 #
 #   CREATE DATABASE agent_memory;  -- in psql
 #
-#   export ANTHROPIC_API_KEY=...
+#   export OPENAI_API_KEY=...
 #   export PG_URI=postgresql://user:pass@localhost:5432/agent_memory
 # =============================================================================
 
 import os
 from typing import Annotated
-from langchain_anthropic import ChatAnthropic
+from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.tools import tool
 from langchain_postgres import PGVector
-from langchain_community.embeddings import HuggingFaceEmbeddings   # free, local
-# from langchain_anthropic import AnthropicEmbeddings               # or this
+from langchain_community.embeddings import HuggingFaceEmbeddings
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
@@ -35,12 +30,8 @@ from typing_extensions import TypedDict
 
 PG_URI = os.environ["PG_URI"]
 
-
-# ── Embeddings + Vector store ─────────────────────────────────────────────────
-# PGVector creates the table on first use (create_if_not_exists=True).
-# Swap the embedding model to whatever you prefer — just keep dimensions consistent.
-
-embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")  # 384-dim, runs locally
+# ── Embeddings + Vector store ────────────────────────────────────────────────
+embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")  # 384-dim
 
 vector_store = PGVector(
     embeddings=embeddings,
@@ -49,29 +40,21 @@ vector_store = PGVector(
     use_jsonb=True,
 )
 
-
-# ── Memory helpers ─────────────────────────────────────────────────────────────
-
+# ── Memory helpers ───────────────────────────────────────────────────────────
 def remember(text: str, metadata: dict = {}):
-    """Save a fact or piece of context to long-term memory."""
     vector_store.add_texts([text], metadatas=[metadata])
 
 def recall(query: str, k: int = 3) -> str:
-    """Retrieve the k most relevant memories for a query."""
     docs = vector_store.similarity_search(query, k=k)
     if not docs:
         return ""
     return "\n".join(f"- {d.page_content}" for d in docs)
 
-
-# ── State ─────────────────────────────────────────────────────────────────────
-
+# ── State ────────────────────────────────────────────────────────────────────
 class State(TypedDict):
     messages: Annotated[list, add_messages]
 
-
-# ── Tools ─────────────────────────────────────────────────────────────────────
-
+# ── Tools ────────────────────────────────────────────────────────────────────
 @tool
 def save_memory(fact: str) -> str:
     """Save an important fact about the user or conversation to long-term memory."""
@@ -89,17 +72,12 @@ def calculator(expression: str) -> str:
 
 TOOLS = [calculator, save_memory]
 
-
-# ── Model ─────────────────────────────────────────────────────────────────────
-
-llm = ChatAnthropic(model="claude-sonnet-4-5-20251022", max_tokens=2048)
+# ── Model ────────────────────────────────────────────────────────────────────
+llm = ChatOpenAI(model="gpt-4o-mini", max_tokens=2048)
 model = llm.bind_tools(TOOLS)
 
-
-# ── Nodes ─────────────────────────────────────────────────────────────────────
-
+# ── Nodes ────────────────────────────────────────────────────────────────────
 def agent_node(state: State):
-    # Pull relevant memories based on the latest user message
     last_user_msg = next(
         (m.content for m in reversed(state["messages"]) if isinstance(m, HumanMessage)),
         ""
@@ -120,13 +98,9 @@ def should_continue(state: State):
     last = state["messages"][-1]
     return "tools" if getattr(last, "tool_calls", None) else END
 
-
-# ── Graph ─────────────────────────────────────────────────────────────────────
-# PostgresSaver persists the message thread so conversations survive restarts.
-# thread_id in config = one conversation; different IDs = isolated sessions.
-
+# ── Graph ────────────────────────────────────────────────────────────────────
 checkpointer = PostgresSaver.from_conn_string(PG_URI)
-checkpointer.setup()  # creates checkpoint tables on first run
+checkpointer.setup()
 
 graph = (
     StateGraph(State)
@@ -138,9 +112,7 @@ graph = (
     .compile(checkpointer=checkpointer)
 )
 
-
-# ── Multi-turn REPL ───────────────────────────────────────────────────────────
-
+# ── Multi-turn REPL ──────────────────────────────────────────────────────────
 def chat(message: str, thread_id: str = "default") -> str:
     config = {"configurable": {"thread_id": thread_id}}
     result = graph.invoke({"messages": [HumanMessage(message)]}, config=config)
