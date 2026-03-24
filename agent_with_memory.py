@@ -17,30 +17,32 @@
 
 import os
 from typing import Annotated
-from langchain_openai import ChatOpenAI
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.tools import tool
-from langchain_postgres import PGVector
-from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_pinecone import PineconeVectorStore
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
 from langgraph.checkpoint.postgres import PostgresSaver
 from typing_extensions import TypedDict
+import pinecone
 
-PG_URI = os.environ["PG_URI"]
+# ── Setup Pinecone ────────────────────────────────────────────────
+pinecone_api_key = os.environ["PINECONE_API_KEY"]
+pinecone_env = os.environ["PINECONE_ENVIRONMENT"]
 
-# ── Embeddings + Vector store ────────────────────────────────────────────────
-embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")  # 384-dim
+pinecone.init(api_key=pinecone_api_key, environment=pinecone_env)
 
-vector_store = PGVector(
-    embeddings=embeddings,
-    collection_name="agent_memory",
-    connection=PG_URI,
-    use_jsonb=True,
+# ── Embeddings + Vector store ─────────────────────────────────────
+embeddings = OpenAIEmbeddings(model="text-embedding-3-small")  # or "text-embedding-3-large"
+
+vector_store = PineconeVectorStore(
+    index_name="agent-memory",   # must exist in Pinecone dashboard
+    embedding=embeddings
 )
 
-# ── Memory helpers ───────────────────────────────────────────────────────────
+# ── Memory helpers ────────────────────────────────────────────────
 def remember(text: str, metadata: dict = {}):
     vector_store.add_texts([text], metadatas=[metadata])
 
@@ -50,11 +52,11 @@ def recall(query: str, k: int = 3) -> str:
         return ""
     return "\n".join(f"- {d.page_content}" for d in docs)
 
-# ── State ────────────────────────────────────────────────────────────────────
+# ── State ─────────────────────────────────────────────────────────
 class State(TypedDict):
     messages: Annotated[list, add_messages]
 
-# ── Tools ────────────────────────────────────────────────────────────────────
+# ── Tools ─────────────────────────────────────────────────────────
 @tool
 def save_memory(fact: str) -> str:
     """Save an important fact about the user or conversation to long-term memory."""
@@ -72,11 +74,11 @@ def calculator(expression: str) -> str:
 
 TOOLS = [calculator, save_memory]
 
-# ── Model ────────────────────────────────────────────────────────────────────
+# ── Model ─────────────────────────────────────────────────────────
 llm = ChatOpenAI(model="gpt-4o-mini", max_tokens=2048)
 model = llm.bind_tools(TOOLS)
 
-# ── Nodes ────────────────────────────────────────────────────────────────────
+# ── Nodes ─────────────────────────────────────────────────────────
 def agent_node(state: State):
     last_user_msg = next(
         (m.content for m in reversed(state["messages"]) if isinstance(m, HumanMessage)),
@@ -98,7 +100,8 @@ def should_continue(state: State):
     last = state["messages"][-1]
     return "tools" if getattr(last, "tool_calls", None) else END
 
-# ── Graph ────────────────────────────────────────────────────────────────────
+# ── Graph ─────────────────────────────────────────────────────────
+PG_URI = os.environ["PG_URI"]
 checkpointer = PostgresSaver.from_conn_string(PG_URI)
 checkpointer.setup()
 
@@ -112,7 +115,7 @@ graph = (
     .compile(checkpointer=checkpointer)
 )
 
-# ── Multi-turn REPL ──────────────────────────────────────────────────────────
+# ── Multi-turn REPL ───────────────────────────────────────────────
 def chat(message: str, thread_id: str = "default") -> str:
     config = {"configurable": {"thread_id": thread_id}}
     result = graph.invoke({"messages": [HumanMessage(message)]}, config=config)
